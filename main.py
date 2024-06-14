@@ -11,15 +11,9 @@ import csv
 import os
 from decimal import Decimal
 from queue import Queue
+from settings import RPC_URLS, WORKERS, MAX_WALLETS, DATE
 
 # RPC узлы
-RPC_URLS = [
-    'твоя rpc',
-    'твоя rpc',
-    'твоя rpc',
-    'твоя rpc'
-#'твоя rpc' - можешь добавить сколько угодно
-]
 
 # Инициализация Web3
 web3_providers = [Web3(Web3.HTTPProvider(url)) for url in RPC_URLS]
@@ -94,7 +88,7 @@ def process_wallet(wallet, start_date, total_days, eth_price, cache, web3, progr
         total_balance = Decimal(cache[cache_key]['total_balance'])
     else:
         day_chunks = [start_date + timedelta(days=i) for i in range(total_days)]
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             futures = [executor.submit(process_day, wallet, current_date, web3) for current_date in day_chunks]
             for future in tqdm(as_completed(futures), total=len(futures), desc=f'Processing {wallet}'):
                 end_balance = future.result()
@@ -147,7 +141,7 @@ def main():
     cache_file = 'balance_cache.json'
     # Начальная и конечная дата
     start_date = datetime.strptime('2023-10-18', '%Y-%m-%d')
-    end_date = datetime.strptime('2024-06-14', '%Y-%m-%d')
+    end_date = datetime.strptime(DATE, '%Y-%m-%d')
     total_days = (end_date - start_date).days + 1
     eth_price = Decimal('3460')  # курс эфира
 
@@ -169,9 +163,9 @@ def main():
     progress_positions = {wallet: i for i, wallet in enumerate(wallets)}
 
 # Настройка нагрузки на каждый rcp узел
-    with ThreadPoolExecutor(max_workers=len(RPC_URLS) * 5) as executor:
+    with ThreadPoolExecutor(max_workers=len(RPC_URLS) * MAX_WALLETS) as executor:
         for web3 in web3_providers:
-            for _ in range(5):
+            for _ in range(MAX_WALLETS):
                 executor.submit(worker, queue, start_date, total_days, eth_price, cache, web3, progress_positions)
 
         queue.join()  # Ожидание завершения всех задач
