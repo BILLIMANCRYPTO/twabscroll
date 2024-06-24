@@ -1,5 +1,6 @@
 import requests
 import json
+import logging
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 from datetime import datetime, timedelta
@@ -11,9 +12,12 @@ import csv
 import os
 from decimal import Decimal
 from queue import Queue
-from settings import RPC_URLS, WORKERS, MAX_WALLETS, DATE
+from collections import OrderedDict
+from settings import RPC_URLS, WORKERS, MAX_WALLETS, DATE, PRICE
 
-# RPC узлы
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Инициализация Web3
 web3_providers = [Web3(Web3.HTTPProvider(url)) for url in RPC_URLS]
@@ -79,25 +83,37 @@ def process_day(wallet, current_date, web3):
     return end_balance
 
 # Функция для обработки одного кошелька
-# Настройка скорости потоков
-def process_wallet(wallet, start_date, total_days, eth_price, cache, web3, progress):
+def process_wallet(wallet, start_date, end_date, total_days, eth_price, cache, web3, progress):
     total_balance = Decimal(0)
     cache_key = wallet.lower()
-    if cache_key in cache:
-        print(f'Using cached data for wallet {wallet}')
-        total_balance = Decimal(cache[cache_key]['total_balance'])
+    cache_data = cache.get(cache_key, {})
+    last_checked = cache_data.get('last_checked')
+    cached_total_balance = Decimal(cache_data.get('total_balance', '0'))
+
+    if last_checked:
+        last_checked_date = datetime.fromisoformat(last_checked)
     else:
-        day_chunks = [start_date + timedelta(days=i) for i in range(total_days)]
+        last_checked_date = start_date
+
+    if last_checked_date >= end_date:
+        # Use cached data if it's already up to date
+        total_balance = cached_total_balance
+    else:
+        # Calculate balance for missing dates
+        day_chunks = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        missing_dates = [d for d in day_chunks if d > last_checked_date]
+
         with ThreadPoolExecutor(max_workers=WORKERS) as executor:
-            futures = [executor.submit(process_day, wallet, current_date, web3) for current_date in day_chunks]
+            futures = [executor.submit(process_day, wallet, current_date, web3) for current_date in missing_dates]
             for future in tqdm(as_completed(futures), total=len(futures), desc=f'Processing {wallet}'):
                 end_balance = future.result()
                 total_balance += end_balance
                 progress.update(1)
 
+        total_balance += cached_total_balance
         cache[cache_key] = {
-            'total_balance': str(total_balance),  # Преобразование Decimal в строку
-            'last_checked': datetime.now().isoformat()
+            'total_balance': str(total_balance),
+            'last_checked': end_date.isoformat()
         }
 
     average_balance = total_balance / total_days
@@ -121,16 +137,17 @@ def save_cache(cache_file, cache):
     with open(cache_file, 'w') as file:
         json.dump(cache_to_save, file, indent=4)
 
-def worker(queue, start_date, total_days, eth_price, cache, web3, progress_positions):
+def worker(queue, start_date, end_date, total_days, eth_price, cache, web3, progress_positions):
     while not queue.empty():
         wallet = queue.get()
         try:
             progress = tqdm(total=total_days, desc=f'Analyzing Wallet {wallet}', position=progress_positions[wallet])
-            wallet_address, TWAB = process_wallet(wallet, start_date, total_days, eth_price, cache, web3, progress)
-            results.append((wallet_address, TWAB))
-            print(f'Wallet: {wallet_address} TWAB: {TWAB} USD')
+            logger.info(f'Starting analysis for wallet {wallet}')
+            wallet_address, TWAB = process_wallet(wallet, start_date, end_date, total_days, eth_price, cache, web3, progress)
+            results[wallet_address] = TWAB
+            logger.info(f'Finished analysis for wallet {wallet}: TWAB {TWAB} USD')
         except Exception as e:
-            print(f'Error processing wallet {wallet}: {e}')
+            logger.error(f'Error processing wallet {wallet}: {e}')
         finally:
             queue.task_done()
 
@@ -143,7 +160,7 @@ def main():
     start_date = datetime.strptime('2023-10-18', '%Y-%m-%d')
     end_date = datetime.strptime(DATE, '%Y-%m-%d')
     total_days = (end_date - start_date).days + 1
-    eth_price = Decimal('3460')  # курс эфира
+    eth_price = Decimal(PRICE)  # курс эфира
 
     # Чтение адресов кошельков
     wallets = read_wallets(wallets_file)
@@ -152,7 +169,7 @@ def main():
     cache = load_cache(cache_file)
 
     global results
-    results = []
+    results = OrderedDict()
 
     # Создание очереди задач
     queue = Queue()
@@ -162,11 +179,10 @@ def main():
     # Создание словаря для отслеживания позиций прогресс-баров
     progress_positions = {wallet: i for i, wallet in enumerate(wallets)}
 
-# Настройка нагрузки на каждый rcp узел
     with ThreadPoolExecutor(max_workers=len(RPC_URLS) * MAX_WALLETS) as executor:
         for web3 in web3_providers:
             for _ in range(MAX_WALLETS):
-                executor.submit(worker, queue, start_date, total_days, eth_price, cache, web3, progress_positions)
+                executor.submit(worker, queue, start_date, end_date, total_days, eth_price, cache, web3, progress_positions)
 
         queue.join()  # Ожидание завершения всех задач
 
@@ -175,7 +191,8 @@ def main():
         fieldnames = ['Index', 'Wallet', 'TWAB']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        for idx, (wallet, twab) in enumerate(results, start=1):
+        for idx, wallet in enumerate(wallets, start=1):
+            twab = results.get(wallet, 'N/A')
             writer.writerow({'Index': idx, 'Wallet': wallet, 'TWAB': twab})
 
     # Сохранение кеша
